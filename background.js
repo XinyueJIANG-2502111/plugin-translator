@@ -1,43 +1,136 @@
-// background.js
+const TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single";
+const REQUEST_TIMEOUT_MS = 10000;
+const MAX_TEXT_LENGTH = 1500;
+const MAX_CACHE_ENTRIES = 100;
+const DEFAULT_SOURCE_LANGUAGE = "auto";
+const DEFAULT_TARGET_LANGUAGE = "zh-CN";
+const SUPPORTED_SOURCE_LANGUAGES = new Set(["auto", "en"]);
+const SUPPORTED_TARGET_LANGUAGES = new Set([
+    "zh-CN",
+    "zh-TW",
+    "ja",
+    "ko",
+    "es",
+    "fr",
+    "de"
+]);
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === "translate") {
-        const text = encodeURIComponent(request.text);
-        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${text}`;
+const translationCache = new Map();
+const pendingTranslations = new Map();
 
-        fetch(url)
-            .then(response => {
-                if (!response.ok) {
-                    // Purpose: Handle HTTP errors safely without blocking the response channel
-                    // 目的：安全地处理 HTTP 错误，避免阻塞响应通道
-                    sendResponse({ success: false, error: `HTTP ${response.status}` });
-                    return null;
-                }
-                return response.text();
-            })
-            .then(textData => {
-                // If previous step returned null due to HTTP error, skip JSON parsing
-                // 如果上一步因为 HTTP 错误返回了 null，则跳过 JSON 解析
-                if (!textData) return; 
+function normalizeSourceLanguage(language) {
+    // Add explicit source language codes to this allowlist when supported.
+    return SUPPORTED_SOURCE_LANGUAGES.has(language)
+        ? language
+        : DEFAULT_SOURCE_LANGUAGE;
+}
 
-                try {
-                    const data = JSON.parse(textData);
-                    if (data && data[0]) {
-                        let translatedText = data[0].map(item => item[0]).join('');
-                        sendResponse({ success: true, text: translatedText });
-                    } else {
-                        sendResponse({ success: false, error: "数据格式不匹配" });
-                    }
-                } catch (e) {
-                    sendResponse({ success: false, error: "触发人机验证，请稍后再试" });
-                }
-            })
-            .catch(error => {
-                // Critical Fix: Ensure sendResponse is ALWAYS called even if the network fails completely
-                // 关键修复：确保即使网络完全失败，也必定调用 sendResponse 通知前端，防止卡死
-                sendResponse({ success: false, error: error.message || "网络请求失败" });
+function normalizeTargetLanguage(language) {
+    return SUPPORTED_TARGET_LANGUAGES.has(language)
+        ? language
+        : DEFAULT_TARGET_LANGUAGE;
+}
+
+function cacheTranslation(cacheKey, translation) {
+    if (translationCache.size >= MAX_CACHE_ENTRIES) {
+        const oldestKey = translationCache.keys().next().value;
+        translationCache.delete(oldestKey);
+    }
+    translationCache.set(cacheKey, translation);
+}
+
+async function requestTranslation(text, sourceLanguage, targetLanguage) {
+    const cacheKey = `${sourceLanguage}\n${targetLanguage}\n${text}`;
+    if (translationCache.has(cacheKey)) {
+        return translationCache.get(cacheKey);
+    }
+
+    // Keep requests and cached results separate for each language pair.
+    if (pendingTranslations.has(cacheKey)) {
+        return pendingTranslations.get(cacheKey);
+    }
+
+    const request = (async () => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        const query = new URLSearchParams({
+            client: "gtx",
+            sl: sourceLanguage,
+            tl: targetLanguage,
+            dt: "t",
+            q: text
+        });
+
+        try {
+            const response = await fetch(`${TRANSLATE_ENDPOINT}?${query}`, {
+                signal: controller.signal
             });
 
-        return true; // Keep the message channel open for async service worker / 保持异步通信通道开启
+            if (!response.ok) {
+                throw new Error(`Translation service returned HTTP ${response.status}.`);
+            }
+
+            const data = await response.json();
+            if (!Array.isArray(data?.[0])) {
+                throw new Error("Translation service returned an unexpected response.");
+            }
+
+            const translation = data[0]
+                .filter((segment) => Array.isArray(segment) && typeof segment[0] === "string")
+                .map((segment) => segment[0])
+                .join("");
+
+            if (!translation) {
+                throw new Error("Translation service returned an empty response.");
+            }
+
+            cacheTranslation(cacheKey, translation);
+            return translation;
+        } catch (error) {
+            if (error?.name === "AbortError") {
+                throw new Error("Translation request timed out.");
+            }
+            throw error;
+        } finally {
+            clearTimeout(timeoutId);
+        }
+    })();
+
+    pendingTranslations.set(cacheKey, request);
+    try {
+        return await request;
+    } finally {
+        pendingTranslations.delete(cacheKey);
     }
+}
+
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+    if (request?.action !== "translate") {
+        return false;
+    }
+
+    const text = typeof request.text === "string" ? request.text.trim() : "";
+    if (!text) {
+        sendResponse({ success: false, error: "No text was provided." });
+        return false;
+    }
+    if (text.length > MAX_TEXT_LENGTH) {
+        sendResponse({ success: false, error: `Text exceeds ${MAX_TEXT_LENGTH} characters.` });
+        return false;
+    }
+
+    const sourceLanguage = normalizeSourceLanguage(request.sourceLanguage);
+    const targetLanguage = normalizeTargetLanguage(request.targetLanguage);
+
+    requestTranslation(text, sourceLanguage, targetLanguage)
+        .then((translation) => sendResponse({ success: true, text: translation }))
+        .catch((error) => {
+            sendResponse({
+                success: false,
+                error: error?.message || "Translation request failed."
+            });
+        });
+
+    // Keep the message channel open until the asynchronous request completes.
+    return true;
 });
