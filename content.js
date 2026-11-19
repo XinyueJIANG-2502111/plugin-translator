@@ -1,10 +1,11 @@
 const HOVER_DELAY_MS = 500;
 const TOOLTIP_HIDE_DELAY_MS = 200;
+const MESSAGE_TIMEOUT_MS = 12000;
 const MAX_TEXT_LENGTH = 1500;
 const DEFAULT_SOURCE_LANGUAGE = "auto";
 const DEFAULT_TARGET_LANGUAGE = "zh-CN";
 const SUPPORTED_SOURCE_LANGUAGES = new Set(["auto", "en"]);
-const SUPPORTED_TARGET_LANGUAGES = new Set(["zh-CN", "zh-TW", "ja", "ko", "es", "fr", "de"]);
+const SUPPORTED_TARGET_LANGUAGES = new Set(["en", "zh-CN", "zh-TW", "ja", "ko", "es", "fr", "de"]);
 const BLOCK_SELECTOR = "p, li, blockquote, figcaption, td, th, h1, h2, h3, h4, h5, h6";
 const IGNORED_SELECTOR = "input, textarea, select, option, [contenteditable='true']";
 
@@ -22,6 +23,7 @@ let isMouseInTooltip = false;
 let hoverTarget = null;
 let currentTranslateTarget = null;
 let requestSequence = 0;
+let activeRequestId = null;
 let latestPointerEvent = null;
 
 function setPluginEnabled(enabled, announce = false) {
@@ -35,25 +37,33 @@ function setPluginEnabled(enabled, announce = false) {
     }
 }
 
-function setSourceLanguage(language) {
-    // Extend this allowlist when more explicit source languages are added.
-    sourceLanguage = SUPPORTED_SOURCE_LANGUAGES.has(language)
-        ? language
+function setLanguagePair(source, target, repairStorage = false) {
+    // Keep explicit source and target languages different in every tab.
+    const nextSource = SUPPORTED_SOURCE_LANGUAGES.has(source)
+        ? source
         : DEFAULT_SOURCE_LANGUAGE;
-    clearHoverState(true);
-}
-
-function setTargetLanguage(language) {
-    targetLanguage = SUPPORTED_TARGET_LANGUAGES.has(language)
-        ? language
+    let nextTarget = SUPPORTED_TARGET_LANGUAGES.has(target)
+        ? target
         : DEFAULT_TARGET_LANGUAGE;
-    clearHoverState(true);
+    if (nextSource !== "auto" && nextSource === nextTarget) {
+        nextTarget = DEFAULT_TARGET_LANGUAGE;
+    }
+
+    const needsRepair = source !== nextSource || target !== nextTarget;
+    const hasChanged = sourceLanguage !== nextSource || targetLanguage !== nextTarget;
+    sourceLanguage = nextSource;
+    targetLanguage = nextTarget;
+    if (hasChanged) {
+        clearHoverState(true);
+    }
+    if (repairStorage && needsRepair) {
+        chrome.storage.local.set({ sourceLanguage, targetLanguage });
+    }
 }
 
 chrome.storage.local.get(["pluginEnabled", "sourceLanguage", "targetLanguage"], (result) => {
     setPluginEnabled(result.pluginEnabled !== false);
-    setSourceLanguage(result.sourceLanguage);
-    setTargetLanguage(result.targetLanguage);
+    setLanguagePair(result.sourceLanguage, result.targetLanguage, true);
 });
 
 // Observe the shared setting so every open tab changes state immediately.
@@ -61,11 +71,14 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName === "local" && changes.pluginEnabled) {
         setPluginEnabled(changes.pluginEnabled.newValue !== false, true);
     }
-    if (areaName === "local" && changes.targetLanguage) {
-        setTargetLanguage(changes.targetLanguage.newValue);
-    }
-    if (areaName === "local" && changes.sourceLanguage) {
-        setSourceLanguage(changes.sourceLanguage.newValue);
+    if (areaName === "local" && (changes.sourceLanguage || changes.targetLanguage)) {
+        const nextSource = changes.sourceLanguage
+            ? changes.sourceLanguage.newValue
+            : sourceLanguage;
+        const nextTarget = changes.targetLanguage
+            ? changes.targetLanguage.newValue
+            : targetLanguage;
+        setLanguagePair(nextSource, nextTarget, true);
     }
 });
 
@@ -286,25 +299,62 @@ function getTextFromSource(source) {
     return normalizeText(source.target.innerText || source.target.textContent || "");
 }
 
-function translateText(text) {
+function translateText(text, requestId) {
     return new Promise((resolve) => {
-        chrome.runtime.sendMessage({
-            action: "translate",
-            text,
-            sourceLanguage,
-            targetLanguage
-        }, (response) => {
-            if (chrome.runtime.lastError) {
-                resolve(`[Error] ${chrome.runtime.lastError.message}`);
+        let isSettled = false;
+        const finish = (result) => {
+            if (isSettled) {
                 return;
             }
-            if (response?.success) {
-                resolve(response.text);
-                return;
-            }
-            resolve(`[Error] ${response?.error || "Translation request failed."}`);
-        });
+            isSettled = true;
+            clearTimeout(timeoutId);
+            resolve(result);
+        };
+        const timeoutId = setTimeout(() => {
+            finish("[Error] Translation response timed out.");
+        }, MESSAGE_TIMEOUT_MS);
+
+        try {
+            chrome.runtime.sendMessage({
+                action: "translate",
+                text,
+                sourceLanguage,
+                targetLanguage,
+                requestId
+            }, (response) => {
+                if (chrome.runtime.lastError) {
+                    finish(`[Error] ${chrome.runtime.lastError.message}`);
+                    return;
+                }
+                if (response?.success) {
+                    finish(response.text);
+                    return;
+                }
+                finish(`[Error] ${response?.error || "Translation request failed."}`);
+            });
+        } catch (error) {
+            finish(`[Error] ${error?.message || "Translation request failed."}`);
+        }
     });
+}
+
+function cancelActiveTranslation() {
+    if (activeRequestId === null) {
+        return;
+    }
+
+    const requestId = activeRequestId;
+    activeRequestId = null;
+    try {
+        chrome.runtime.sendMessage({
+            action: "cancelTranslate",
+            requestId
+        }, () => {
+            void chrome.runtime.lastError;
+        });
+    } catch (_error) {
+        // The extension context may already be unavailable during page teardown.
+    }
 }
 
 function createTooltip() {
@@ -413,6 +463,7 @@ function hideTooltip(immediate = false) {
 }
 
 function clearHoverState(immediate = false) {
+    cancelActiveTranslation();
     clearTimeout(hoverTimer);
     hoverTimer = null;
     hoverTarget = null;
@@ -430,9 +481,30 @@ function isValidTarget(target) {
         && !target.closest(IGNORED_SELECTOR);
 }
 
+function isIgnoredTarget(target) {
+    return target instanceof Element && target.closest(IGNORED_SELECTOR) !== null;
+}
+
 function processPointerMove(event) {
     animationFrameId = null;
-    if (!pluginEnabled || isMouseInTooltip || !isValidTarget(event.target)) {
+    if (!pluginEnabled) {
+        return;
+    }
+
+    const isTooltipTarget = tooltip?.contains(event.target) === true;
+    if (isMouseInTooltip || isTooltipTarget) {
+        return;
+    }
+
+    // Invalidate old work when the pointer enters an input or another ignored area.
+    if (isIgnoredTarget(event.target)) {
+        if (hoverTimer || hoverTarget || currentTranslateTarget) {
+            clearHoverState(true);
+        }
+        return;
+    }
+
+    if (!isValidTarget(event.target)) {
         return;
     }
 
@@ -452,6 +524,7 @@ function processPointerMove(event) {
 
     clearTimeout(hoverTimer);
     if (targetChanged || currentMode === "word") {
+        cancelActiveTranslation();
         requestSequence += 1;
         hideTooltip();
     }
@@ -485,8 +558,12 @@ function processPointerMove(event) {
         }
 
         const requestId = ++requestSequence;
+        activeRequestId = requestId;
         showTooltip(x, y, "Translating...");
-        const translation = await translateText(text);
+        const translation = await translateText(text, requestId);
+        if (activeRequestId === requestId) {
+            activeRequestId = null;
+        }
 
         // Ignore stale responses after the pointer, mode, or enabled state changes.
         if (!pluginEnabled
